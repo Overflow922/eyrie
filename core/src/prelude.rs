@@ -1,30 +1,48 @@
-use http::{HeaderMap, Method, Request, Uri, Version};
-use http_body_util::Full;
-use hyper::body::{Bytes, Incoming};
+use std::collections::HashMap;
 
-pub struct RqWrapper {
-    method: Method,
-    version: Version,
-    headers: HeaderMap,
+/**
+ * Трейт для работы с конфигами роутов для приложения.
+ * Роут - это пара входящий адрес -- список адресатов, 
+ * на который надо переслать запрос.
+ * 
+ * Пример:
+ * Входящий запрос /foo/bar
+ * Перенаправляем на:
+ * https://some-host:9090/foo/bar,
+ * https://another-host:9898/foo/bar 
+ */
+pub trait Config {
+    /**
+     * По урлу понимает на какие адреса надо переслать запросы
+     */
+    fn get_dests(&self, source_addr: &String) -> Option<&Vec<String>>;
+
+    /**
+     * Добавляет пару урл - новые адресаты 
+     */
+    fn add_dests(self, source_addr: String, destinations: Vec<String>);
+
+    /**
+     * Удаляет пару урл - новые адреса
+     */
+    fn delete_dests(self, source_addr: &String);
 }
 
-impl RqWrapper {
-    pub fn new(rq: &Request<Incoming>) -> Self {
-        Self {
-            method: rq.method().clone(),
-            version: rq.version(),
-            headers: rq.headers().clone(),
-        }
+#[derive(Default)]
+pub struct HashMapConfig {
+    _dict: HashMap<String, Vec<String>>,
+}
+
+impl Config for HashMapConfig {
+    fn get_dests(&self, source_addr: &String) -> Option<&Vec<String>> {
+        self._dict.get(source_addr)
     }
 
-    pub fn to_rq(&self, body: &Bytes, uri: Uri) -> Request<Full<Bytes>> {
-        let mut result = Request::builder()
-            .method(self.method.clone())
-            .version(self.version)
-            .uri(uri)
-            .body(Full::new(body.clone()))
-            .unwrap();
-        result.headers_mut().extend(self.headers.clone());
-        result
+    fn add_dests(mut self, source_addr: String, destinations: Vec<String>) {
+        self._dict.insert(source_addr, destinations);
+    }
+
+    fn delete_dests(mut self, source_addr: &String) {
+        self._dict.remove(source_addr);
     }
 }
