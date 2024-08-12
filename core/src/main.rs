@@ -1,4 +1,5 @@
 use std::env;
+use std::time::Duration;
 
 use http::Uri;
 use http_body_util::{BodyExt, Full};
@@ -9,6 +10,8 @@ use hyper::{Request, Response};
 use hyper_util::client::legacy::{Client, Error};
 use hyper_util::rt::{TokioExecutor, TokioIo};
 use tokio::net::TcpListener;
+use tokio::time::error::Elapsed;
+use tokio::time::timeout;
 
 mod prelude;
 
@@ -20,15 +23,21 @@ async fn hello(rq: Request<Incoming>) -> Result<Response<Full<Bytes>>, String> {
             let cl = Client::builder(TokioExecutor::new()).build_http();
             let mut h1 = h.clone();
             h1.uri = to_uri("http://localhost:3001");
-            cl.request(Request::from_parts(h1, Full::new(bytes.clone())))
-                .await
+            timeout(
+                Duration::from_secs(1),
+                cl.request(Request::from_parts(h1, Full::new(bytes.clone()))),
+            )
+            .await
         },
         async {
             let cl = Client::builder(TokioExecutor::new()).build_http();
             let mut h1 = h.clone();
             h1.uri = to_uri("http://localhost:3002");
-            cl.request(Request::from_parts(h1, Full::new(bytes.clone())))
-                .await
+            timeout(
+                Duration::from_secs(1),
+                cl.request(Request::from_parts(h1, Full::new(bytes.clone()))),
+            )
+            .await
         }
     );
 
@@ -36,21 +45,39 @@ async fn hello(rq: Request<Incoming>) -> Result<Response<Full<Bytes>>, String> {
 }
 
 async fn check_result(
-    first: Result<Response<Incoming>, Error>,
-    second: Result<Response<Incoming>, Error>,
+    first: Result<Result<Response<Incoming>, Error>, Elapsed>,
+    second: Result<Result<Response<Incoming>, Error>, Elapsed>,
 ) -> Result<Response<Full<Bytes>>, String> {
-    match first {
-        Ok(rs) => match second {
-            Ok(rs2) => choose_rs(rs, rs2).await,
-            Err(e) => {
-                eprint!("error {}", e);
-                let (parts, body) = rs.into_parts();
-                let body = body.collect().await.expect("msg").to_bytes();
-                Ok(Response::from_parts(parts, Full::new(body)))
-            }
+    match (first, second) {
+        (Ok(val), Ok(val2)) => match (val, val2) {
+            (Ok(rs), Ok(rs2)) => choose_rs(rs, rs2).await,
+            (Ok(rs), Err(err)) | (Err(err), Ok(rs)) => create_rs(rs, err.to_string()).await,
+            (Err(err), Err(_)) => create_err_rs(err.to_string()),
         },
-        Err(e) => Err(e.to_string()),
+        (Ok(rs), Err(err)) | (Err(err), Ok(rs)) => process_part_success(rs, err.to_string()).await,
+        (Err(err), Err(_)) => create_err_rs(err.to_string()),
     }
+}
+
+async fn process_part_success(
+    rs: Result<Response<Incoming>, Error>,
+    err: String,
+) -> Result<Response<Full<Bytes>>, String> {
+    match rs {
+        Ok(r) => create_rs(r, err.to_string()).await,
+        Err(_) => create_err_rs(err.to_string()),
+    }
+}
+
+async fn create_rs(rs: Response<Incoming>, err: String) -> Result<Response<Full<Bytes>>, String> {
+    eprint!("error {}", err);
+    let (parts, body) = rs.into_parts();
+    let body = body.collect().await.expect("msg").to_bytes();
+    Ok(Response::from_parts(parts, Full::new(body)))
+}
+
+fn create_err_rs(err: String) -> Result<Response<Full<Bytes>>, String> {
+    Result::Err(err.to_string())
 }
 
 async fn choose_rs(
