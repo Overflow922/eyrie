@@ -17,7 +17,7 @@ mod prelude;
 
 async fn hello(rq: Request<Incoming>) -> Result<Response<Full<Bytes>>, String> {
     let (h, b) = rq.into_parts();
-    let bytes = b.collect().await.expect("msg").to_bytes(); // can we avoid copying bytes?
+    let bytes = Box::new(b.collect().await.expect("msg").to_bytes());
     let (_first, _second) = tokio::join!(
         async {
             let cl = Client::builder(TokioExecutor::new()).build_http();
@@ -25,7 +25,7 @@ async fn hello(rq: Request<Incoming>) -> Result<Response<Full<Bytes>>, String> {
             h1.uri = to_uri("http://localhost:3001");
             timeout(
                 Duration::from_secs(1),
-                cl.request(Request::from_parts(h1, Full::new(bytes.clone()))),
+                cl.request(Request::from_parts(h1, Full::new(Box::clone(&bytes)))),
             )
             .await
         },
@@ -35,7 +35,7 @@ async fn hello(rq: Request<Incoming>) -> Result<Response<Full<Bytes>>, String> {
             h1.uri = to_uri("http://localhost:3002");
             timeout(
                 Duration::from_secs(1),
-                cl.request(Request::from_parts(h1, Full::new(bytes.clone()))),
+                cl.request(Request::from_parts(h1, Full::new(Box::clone(&bytes)))),
             )
             .await
         }
@@ -49,13 +49,13 @@ async fn check_result(
     second: Result<Result<Response<Incoming>, Error>, Elapsed>,
 ) -> Result<Response<Full<Bytes>>, String> {
     match (first, second) {
-        (Ok(val), Ok(val2)) => match (val, val2) {
-            (Ok(rs), Ok(rs2)) => choose_rs(rs, rs2).await,
-            (Ok(rs), Err(err)) | (Err(err), Ok(rs)) => create_rs(rs, err.to_string()).await,
-            (Err(err), Err(_)) => create_err_rs(err.to_string()),
-        },
-        (Ok(rs), Err(err)) | (Err(err), Ok(rs)) => process_part_success(rs, err.to_string()).await,
+        (Ok(Ok(rs)), Ok(Ok(rs2))) => choose_rs(rs, rs2).await,
+        (Ok(Ok(rs)), Ok(Err(err))) | (Ok(Err(err)), Ok(Ok(rs))) => {
+            create_rs(rs, err.to_string()).await
+        }
+        (Ok(Err(err)), Ok(Err(_))) => create_err_rs(err.to_string()),
         (Err(err), Err(_)) => create_err_rs(err.to_string()),
+        (Ok(rs), Err(err)) | (Err(err), Ok(rs)) => process_part_success(rs, err.to_string()).await,
     }
 }
 
@@ -77,7 +77,7 @@ async fn create_rs(rs: Response<Incoming>, err: String) -> Result<Response<Full<
 }
 
 fn create_err_rs(err: String) -> Result<Response<Full<Bytes>>, String> {
-    Result::Err(err.to_string())
+    Err(err.to_string())
 }
 
 async fn choose_rs(
