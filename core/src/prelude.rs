@@ -12,6 +12,7 @@ use hyper::{Request, Response};
 use hyper_util::client::legacy::Client;
 use hyper_util::rt::TokioExecutor;
 use tokio::time::timeout;
+use anyhow::{anyhow, Result};
 
 /**
  * Трейт для работы с конфигами роутов для приложения.
@@ -55,7 +56,8 @@ impl Config for HashMapConfig {
 pub struct ConfigLoader {}
 
 impl ConfigLoader {
-    pub fn load_from_file(filename: &str) -> Result<impl Config, &str> {
+    pub fn load_from_file(filename: &str) -> Result<impl Config> {
+        println!("Start loading config {filename}");
         let mut config = HashMapConfig::default();
         if let Ok(lines) = Self::read_lines(filename) {
             for line in lines.flatten() {
@@ -68,14 +70,16 @@ impl ConfigLoader {
                         .into_iter()
                         .map(|el| el.trim().to_string())
                         .collect::<Vec<String>>();
+                    println!("Adding pair {:?} -> {:?}", url, destinations);
                     config.add_dests(url.to_string(), destinations)
                 } else {
-                    eprint!("wrong line. {}. Skipped", line);
+                    eprintln!("wrong line. {}. Skipped", line);
                 }
             }
+            println!("Done.");
             Ok(config)
         } else {
-            Err("failed read config file")
+            Err(anyhow!("failed read config file"))
         }
     }
 
@@ -92,13 +96,13 @@ pub trait Router<C>
 where
     C: Config,
 {
-    async fn route1(&self, rq: Request<Incoming>) -> Result<Response<Full<Bytes>>, String>;
+    async fn route1(&self, rq: Request<Incoming>) -> Result<Response<Full<Bytes>>>;
     async fn route(
         &self,
         header: http::request::Parts,
         body: Incoming,
         destinations: Vec<String>,
-    ) -> Result<Response<Full<Bytes>>, String>;
+    ) -> Result<Response<Full<Bytes>>>;
 }
 
 #[derive(Clone)]
@@ -119,31 +123,30 @@ impl<C> ProxyRouter<C>
 where
     C: Config,
 {
-    fn create_err_rs(err: String) -> Result<Response<Full<Bytes>>, String> {
-        Result::Err(err.to_string())
+    fn create_err_rs(err: String) -> Result<Response<Full<Bytes>>> {
+        Result::Err(anyhow!(err))
     }
 
     async fn handle_rses(
-        primary_rs: Result<Response<Incoming>, String>,
-        secondary_rs: Result<Response<Incoming>, String>,
-    ) -> Result<Response<Full<Bytes>>, String> {
+        primary_rs: Result<Response<Incoming>>,
+        secondary_rs: Result<Response<Incoming>>,
+    ) -> Result<Response<Full<Bytes>>> {
         // get first request - supposed to be old service
         let (head, body) = match primary_rs {
             Ok(val) => val.into_parts(),
             Err(err) => return Self::create_err_rs(err.to_string()),
         };
-        let bd = body.collect().await.expect("err").to_bytes();
+        let bd = body.collect().await?.to_bytes();
 
-        let (_, body1) = match secondary_rs {
-            Ok(val) => val.into_parts(),
-            Err(err) => return Self::create_err_rs(err.to_string()),
+        match secondary_rs {
+            Ok(val) => {
+                let el = val.into_parts().1.collect().await?.to_bytes();
+                if el != bd {
+                    eprintln!("rses differs");
+                };
+            },
+            Err(err) => eprintln!("error {}", err.to_string()),
         };
-
-        let el = body1.collect().await.expect("err").to_bytes();
-
-        if el != bd {
-            eprintln!("rses differs");
-        }
 
         Ok(Response::from_parts(head, Full::new(bd)))
     }
@@ -161,14 +164,14 @@ impl<C> Router<C> for ProxyRouter<C>
 where
     C: Config,
 {
-    async fn route1(&self, rq: Request<Incoming>) -> Result<Response<Full<Bytes>>, String> {
+    async fn route1(&self, rq: Request<Incoming>) -> Result<Response<Full<Bytes>>> {
         let (h, b) = rq.into_parts();
         let lock = self.0.lock().unwrap();
         let dests = lock.get_dests(&Self::resolve_path(&h).to_string());
         if let Some(v) = dests {
             self.route(h.clone(), b, v.clone()).await
         } else {
-            Err("can't find route".to_string())
+            Err(anyhow!("can't find route"))
         }
     }
 
@@ -177,18 +180,20 @@ where
         mut header: http::request::Parts,
         body: Incoming,
         dests: Vec<String>, // assume the size is 2
-    ) -> Result<Response<Full<Bytes>>, String> {
+    ) -> Result<Response<Full<Bytes>>> {
         let bytes = body.collect().await.expect("msg").to_bytes(); // can we avoid copying bytes?
 
         let (original_rs, secondary_rs) = tokio::join!(
             {
+                println!("doing rq {}", dests[0]);
                 header.uri = Self::to_uri(dests[0].clone().as_str());
                 let value = header.clone();
                 let b = bytes.clone();
                 async move { fun_name(value, b).await }
             },
             {
-                header.uri = Self::to_uri(dests[0].clone().as_str());
+                println!("doing rq {}", dests[1]);
+                header.uri = Self::to_uri(dests[1].clone().as_str());
                 let value = header.clone();
                 let b = bytes.clone();
                 async move { fun_name(value, b).await }
@@ -199,7 +204,7 @@ where
     }
 }
 
-async fn fun_name(value: http::request::Parts, b: Bytes) -> Result<Response<Incoming>, String> {
+async fn fun_name(value: http::request::Parts, b: Bytes) -> Result<Response<Incoming>> {
     let cl = Client::builder(TokioExecutor::new()).build_http();
     let res = timeout(
         Duration::from_secs(1),
@@ -209,8 +214,8 @@ async fn fun_name(value: http::request::Parts, b: Bytes) -> Result<Response<Inco
     match res {
         Ok(r) => match r {
             Ok(rr) => Ok(rr),
-            Err(err) => Err(err.to_string()),
+            Err(err) => Err(anyhow!(err)),
         },
-        Err(err) => Err(err.to_string()),
+        Err(err) => Err(anyhow!(err)),
     }
 }
