@@ -3,4 +3,5 @@
 members = [
     "core",
     "tools"]
-
+    
+resolver = "2"

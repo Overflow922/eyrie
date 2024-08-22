@@ -2,17 +2,17 @@ use std::collections::HashMap;
 use std::fs::File;
 use std::io::{self, BufRead};
 use std::path::Path;
-use std::sync::{Arc, Mutex};
+use std::sync::Arc;
 use std::time::Duration;
 
+use anyhow::{anyhow, Result};
 use http::Uri;
 use http_body_util::{BodyExt, Full};
 use hyper::body::{Bytes, Incoming};
 use hyper::{Request, Response};
 use hyper_util::client::legacy::Client;
 use hyper_util::rt::TokioExecutor;
-use tokio::time::timeout;
-use anyhow::{anyhow, Result};
+use tokio::{sync::Mutex, time::timeout};
 
 /**
  * Трейт для работы с конфигами роутов для приложения.
@@ -29,7 +29,7 @@ pub trait Config {
     /**
      * По урлу понимает на какие адреса надо переслать запросы
      */
-    fn get_dests(&self, source_addr: &String) -> Option<&Vec<String>>;
+    fn get_dests(&self, source_addr: &str) -> Option<&Vec<String>>;
 
     /**
      * Добавляет пару урл - новые адресаты
@@ -43,7 +43,7 @@ pub struct HashMapConfig {
 }
 
 impl Config for HashMapConfig {
-    fn get_dests(&self, source_addr: &String) -> Option<&Vec<String>> {
+    fn get_dests(&self, source_addr: &str) -> Option<&Vec<String>> {
         self.dict.get(source_addr)
     }
 
@@ -60,14 +60,13 @@ impl ConfigLoader {
         println!("Start loading config {filename}");
         let mut config = HashMapConfig::default();
         if let Ok(lines) = Self::read_lines(filename) {
-            for line in lines.flatten() {
+            for line in lines.map_while(Result::ok) {
                 let sides: Vec<_> = line.split("->").collect();
                 if sides.len() == 2 {
                     let url = sides[0].trim();
                     let destinations = sides[1]
                         .trim()
                         .split(',')
-                        .into_iter()
                         .map(|el| el.trim().to_string())
                         .collect::<Vec<String>>();
                     println!("Adding pair {:?} -> {:?}", url, destinations);
@@ -96,13 +95,7 @@ pub trait Router<C>
 where
     C: Config,
 {
-    async fn route1(&self, rq: Request<Incoming>) -> Result<Response<Full<Bytes>>>;
-    async fn route(
-        &self,
-        header: http::request::Parts,
-        body: Incoming,
-        destinations: Vec<String>,
-    ) -> Result<Response<Full<Bytes>>>;
+    async fn route(&self, rq: Request<Incoming>) -> Result<Response<Full<Bytes>>>;
 }
 
 #[derive(Clone)]
@@ -117,6 +110,51 @@ where
     pub fn new(config: C) -> Self {
         ProxyRouter(Arc::new(Mutex::new(config)))
     }
+
+    async fn route_internal(
+        &self,
+        mut header: http::request::Parts,
+        body: Incoming,
+        destinations: Vec<String>,
+    ) -> Result<Response<Full<Bytes>>> {
+        let bytes = Box::new(body.collect().await?.to_bytes());
+
+        let (original_rs, secondary_rs) = tokio::join!(
+            {
+                println!("doing rq {}", destinations[0]);
+                header.uri = Self::to_uri(destinations[0].clone().as_str());
+                let value = header.clone();
+                let b = bytes.clone();
+                async move { Self::fun_name(value, *b).await }
+            },
+            {
+                println!("doing rq {}", destinations[1]);
+                header.uri = Self::to_uri(destinations[1].clone().as_str());
+                let value = header.clone();
+                let b = bytes.clone();
+                async move { Self::fun_name(value, *b).await }
+            }
+        );
+
+        Self::handle_rses(original_rs, secondary_rs).await
+    }
+
+    async fn fun_name(value: http::request::Parts, b: Bytes) -> Result<Response<Incoming>> {
+        let cl = Client::builder(TokioExecutor::new()).build_http();
+        let res = timeout(
+            Duration::from_secs(1),
+            cl.request(Request::from_parts(value.clone(), Full::new(b.clone()))),
+        )
+        .await;
+        match res {
+            Ok(r) => match r {
+                Ok(rr) => Ok(rr),
+                Err(err) => Err(anyhow!(err)),
+            },
+            Err(err) => Err(anyhow!(err)),
+        }
+    }
+    
 }
 
 impl<C> ProxyRouter<C>
@@ -144,8 +182,8 @@ where
                 if el != bd {
                     eprintln!("rses differs");
                 };
-            },
-            Err(err) => eprintln!("error {}", err.to_string()),
+            }
+            Err(err) => eprintln!("error {}", err),
         };
 
         Ok(Response::from_parts(head, Full::new(bd)))
@@ -164,58 +202,14 @@ impl<C> Router<C> for ProxyRouter<C>
 where
     C: Config,
 {
-    async fn route1(&self, rq: Request<Incoming>) -> Result<Response<Full<Bytes>>> {
+    async fn route(&self, rq: Request<Incoming>) -> Result<Response<Full<Bytes>>> {
         let (h, b) = rq.into_parts();
-        let lock = self.0.lock().unwrap();
-        let dests = lock.get_dests(&Self::resolve_path(&h).to_string());
+        let lock = self.0.lock().await;
+        let dests = lock.get_dests(Self::resolve_path(&h));
         if let Some(v) = dests {
-            self.route(h.clone(), b, v.clone()).await
+            self.route_internal(h.clone(), b, v.clone()).await
         } else {
             Err(anyhow!("can't find route"))
         }
-    }
-
-    async fn route(
-        &self,
-        mut header: http::request::Parts,
-        body: Incoming,
-        dests: Vec<String>, // assume the size is 2
-    ) -> Result<Response<Full<Bytes>>> {
-        let bytes = body.collect().await.expect("msg").to_bytes(); // can we avoid copying bytes?
-
-        let (original_rs, secondary_rs) = tokio::join!(
-            {
-                println!("doing rq {}", dests[0]);
-                header.uri = Self::to_uri(dests[0].clone().as_str());
-                let value = header.clone();
-                let b = bytes.clone();
-                async move { fun_name(value, b).await }
-            },
-            {
-                println!("doing rq {}", dests[1]);
-                header.uri = Self::to_uri(dests[1].clone().as_str());
-                let value = header.clone();
-                let b = bytes.clone();
-                async move { fun_name(value, b).await }
-            }
-        );
-
-        Self::handle_rses(original_rs, secondary_rs).await
-    }
-}
-
-async fn fun_name(value: http::request::Parts, b: Bytes) -> Result<Response<Incoming>> {
-    let cl = Client::builder(TokioExecutor::new()).build_http();
-    let res = timeout(
-        Duration::from_secs(1),
-        cl.request(Request::from_parts(value.clone(), Full::new(b.clone()))),
-    )
-    .await;
-    match res {
-        Ok(r) => match r {
-            Ok(rr) => Ok(rr),
-            Err(err) => Err(anyhow!(err)),
-        },
-        Err(err) => Err(anyhow!(err)),
     }
 }

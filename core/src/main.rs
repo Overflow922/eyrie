@@ -1,14 +1,11 @@
-use std::{
-    env,
-    sync::{Arc, Mutex},
-};
+use std::{env, sync::Arc};
 
 use crate::prelude::Router;
 use hyper::server::conn::http1;
 use hyper::service::service_fn;
 use hyper_util::rt::TokioIo;
 use prelude::{ConfigLoader, ProxyRouter};
-use tokio::net::TcpListener;
+use tokio::{net::TcpListener, sync::Mutex};
 
 mod prelude;
 
@@ -35,17 +32,14 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
 
         let r = router.clone();
 
-        let kk = {
-            let lock = r.lock().unwrap();
-            let r = lock;
+        tokio::task::spawn(async move {
+            let lock = r.lock().await;
             if let Err(err) = http1::Builder::new()
-                .serve_connection(io, service_fn(|rq| r.route1(rq)))
+                .serve_connection(io, service_fn(|rq| lock.route(rq)))
                 .await
             {
                 eprintln!("Error serving connection: {:?}", err);
             }
-        };
-
-        tokio::task::spawn(async move { kk });
+        });
     }
 }
