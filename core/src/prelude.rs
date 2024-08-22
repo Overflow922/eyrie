@@ -154,7 +154,6 @@ where
             Err(err) => Err(anyhow!(err)),
         }
     }
-    
 }
 
 impl<C> ProxyRouter<C>
