@@ -1,13 +1,13 @@
 use std::{env, sync::Arc};
 
-use crate::prelude::Router;
+use crate::smart_proxy::Router;
 use hyper::server::conn::http1;
 use hyper::service::service_fn;
 use hyper_util::rt::TokioIo;
-use prelude::{ConfigLoader, ProxyRouter};
+use smart_proxy::{ConfigLoader, ProxyRouter};
 use tokio::{net::TcpListener, sync::Mutex};
 
-mod prelude;
+mod smart_proxy;
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {

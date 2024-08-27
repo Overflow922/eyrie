@@ -3,6 +3,7 @@ name = "core"
 version = "0.1.0"
 edition = "2021"
 
+
 [dependencies]
 hyper = { version = "1", features = ["full"] }
 tokio = { version = "1", features = ["full"] }
@@ -11,3 +12,4 @@ http-body-util = "0.1.2"
 hyper-util = { version = "0.1.7", features = ["full"] }
 futures = "0.3.30"
 anyhow = {version = "1.0", features = ["backtrace"]}
+config = "0.14.0"
